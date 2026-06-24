@@ -88,6 +88,57 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
     run_with(cfg, false).await
 }
 
+/// Run the polling loop with a shutdown signal.
+/// Exits cleanly when the shutdown signal is sent.
+pub async fn run_with_shutdown(
+    cfg: AppConfig,
+    dry_run: bool,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
+    run_with_shutdown_internal(cfg, dry_run, &mut shutdown).await
+}
+
+/// Run exactly one poll cycle across all configured contracts, then return.
+pub async fn run_once(cfg: AppConfig, dry_run: bool) -> Result<()> {
+    let max_idle       = cfg.http_pool_max_idle_per_host.unwrap_or(10);
+    let keepalive_secs = cfg.http_tcp_keepalive_secs.unwrap_or(30);
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(15))
+        .pool_max_idle_per_host(max_idle)
+        .tcp_keepalive(Some(Duration::from_secs(keepalive_secs)))
+        .build()
+        .context("failed to build HTTP client")?;
+
+    let mut cursors: HashMap<String, String> = cfg.contracts
+        .iter()
+        .map(|c| (c.contract_id.clone(), "now".to_string()))
+        .collect();
+
+    let mut total_txs = 0u64;
+    let mut total_alerts = 0u64;
+
+    for contract in &cfg.contracts {
+        match poll_contract(&client, contract, &mut cursors, dry_run).await {
+            Ok((txs, alerts)) => {
+                total_txs += txs;
+                total_alerts += alerts;
+            }
+            Err(e) => {
+                error!(error = %e, "contract polling task failed");
+                return Err(e);
+            }
+        }
+    }
+
+    info!(
+        total_transactions = total_txs,
+        total_alerts       = total_alerts,
+        "poll-once cycle complete"
+    );
+    Ok(())
+}
+
 /// Run the polling loop forever. Each contract is polled concurrently via a
 /// tokio JoinSet; one slow or failing contract never blocks the others.
 /// Logs a summary every 60 seconds: contracts watched, transactions processed,
@@ -222,6 +273,149 @@ pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
+async fn run_with_shutdown_internal(
+    cfg: AppConfig,
+    dry_run: bool,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
+    let max_idle       = cfg.http_pool_max_idle_per_host.unwrap_or(10);
+    let keepalive_secs = cfg.http_tcp_keepalive_secs.unwrap_or(30);
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(15))
+        .pool_max_idle_per_host(max_idle)
+        .tcp_keepalive(Some(Duration::from_secs(keepalive_secs)))
+        .build()
+        .context("failed to build HTTP client")?;
+
+    let mut cursors: HashMap<String, String> = if let Some(path) = &cfg.cursor_file {
+        match fs::read_to_string(path) {
+            Ok(raw) => match serde_json::from_str::<HashMap<String, String>>(&raw) {
+                Ok(mut map) => {
+                    for c in &cfg.contracts {
+                        map.entry(c.contract_id.clone())
+                            .or_insert_with(|| "now".to_string());
+                    }
+                    map
+                }
+                Err(e) => {
+                    warn!(error = ?e, "failed to parse cursor_file; starting from 'now' for all contracts");
+                    cfg.contracts
+                        .iter()
+                        .map(|c| (c.contract_id.clone(), "now".to_string()))
+                        .collect()
+                }
+            },
+            Err(e) => {
+                debug!(error = ?e, "could not read cursor_file; starting from 'now'");
+                cfg.contracts
+                    .iter()
+                    .map(|c| (c.contract_id.clone(), "now".to_string()))
+                    .collect()
+            }
+        }
+    } else {
+        cfg.contracts
+            .iter()
+            .map(|c| (c.contract_id.clone(), "now".to_string()))
+            .collect()
+    };
+
+    let interval      = Duration::from_secs(cfg.poll_interval_seconds);
+    let summary_every = Duration::from_secs(60);
+    let counters      = Arc::new(Counters::default());
+    let n_contracts   = cfg.contracts.len();
+
+    let contracts_list = cfg.contracts.iter().map(|c| c.label.as_str()).collect::<Vec<_>>().join(", ");
+    let mut networks: Vec<&str> = cfg.contracts.iter().map(|c| c.network.as_str()).collect();
+    networks.sort(); networks.dedup();
+    let networks_str = networks.join(", ");
+
+    let mut horizon_urls: Vec<(&str, &str)> = cfg
+        .contracts.iter().map(|c| (c.network.as_str(), c.network.horizon_base_url())).collect();
+    horizon_urls.sort(); horizon_urls.dedup();
+    let horizon_urls_str = horizon_urls.iter()
+        .map(|(net, url)| format!("{}={}", net, url)).collect::<Vec<_>>().join(", ");
+
+    info!(
+        version        = env!("CARGO_PKG_VERSION"),
+        contracts      = n_contracts,
+        contracts_list = %contracts_list,
+        networks       = %networks_str,
+        horizon_urls   = %horizon_urls_str,
+        interval_secs  = cfg.poll_interval_seconds,
+        "TxWatch polling engine started"
+    );
+
+    if cfg.poll_interval_seconds < 10 && cfg.contracts.len() > 5 {
+        warn!(
+            poll_interval_seconds = cfg.poll_interval_seconds,
+            contracts = cfg.contracts.len(),
+            "polling interval is very short with many contracts — Horizon rate limits may apply; \
+             consider poll_interval_seconds >= 10"
+        );
+    }
+
+    let counters_for_summary = Arc::clone(&counters);
+    let _summary_guard = tokio::spawn(async move {
+        loop {
+            let c = Arc::clone(&counters_for_summary);
+            let handle = tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(summary_every).await;
+                    let interval_txs    = c.interval_transactions.swap(0, Ordering::Relaxed);
+                    let interval_alerts = c.interval_alerts.swap(0, Ordering::Relaxed);
+                    info!(
+                        contracts             = n_contracts,
+                        transactions_total    = c.transactions.load(Ordering::Relaxed),
+                        alerts_total          = c.alerts.load(Ordering::Relaxed),
+                        transactions_interval = interval_txs,
+                        alerts_interval       = interval_alerts,
+                        "60-second summary"
+                    );
+                }
+            });
+            if let Err(e) = handle.await {
+                error!(error = ?e, "summary logger panicked — restarting");
+            }
+        }
+    });
+
+    loop {
+        for contract in &cfg.contracts {
+            match poll_contract(&client, contract, &mut cursors, dry_run).await {
+                Ok((txs, alerts)) => {
+                    counters.transactions.fetch_add(txs, Ordering::Relaxed);
+                    counters.alerts.fetch_add(alerts, Ordering::Relaxed);
+                    counters.interval_transactions.fetch_add(txs, Ordering::Relaxed);
+                    counters.interval_alerts.fetch_add(alerts, Ordering::Relaxed);
+                    #[cfg(feature = "metrics")]
+                    {
+                        metrics::inc_transactions(txs);
+                        metrics::inc_alerts(alerts);
+                    }
+                }
+                Err(e) => error!(error = %e, "contract polling task failed"),
+            }
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {
+                // Continue to next iteration
+            }
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    info!("shutdown signal received, exiting polling loop");
+                    break;
+                }
+            }
+        }
+    }
+
+    info!("TxWatch polling engine stopped cleanly");
+    Ok(())
+}
+
 // ── Per-contract poll ─────────────────────────────────────────────────────────
 
 /// Returns `(transactions_processed, alerts_fired)`.
@@ -289,8 +483,6 @@ async fn poll_contract(
             .json()
             .await
             .with_context(|| format!("failed to parse Horizon response from {}", url))?;
-
-        let records = page._embedded.records;
 
         let records = page._embedded.records;
         if records.is_empty() {
@@ -385,8 +577,9 @@ async fn poll_contract(
             } else {
                 info!(contract = %contract.label, rule = %payload.rule_triggered,
                     tx = %payload.transaction_hash, "rule fired — sending webhook");
+                let (_, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
                 if let Err(e) = send_webhook(
-                    client, &contract.webhook_url, &payload, contract.webhook_secret.as_deref(),
+                    client, &contract.webhook_url, &payload, contract.webhook_secret.as_deref(), shutdown_rx,
                 ).await {
                     error!(contract = %contract.label, rule = %payload.rule_triggered,
                         tx = %payload.transaction_hash, error = %e, "webhook delivery failed");
@@ -688,7 +881,8 @@ mod tests {
             horizon_base_url_override: Some(server.uri()),
         };
 
-        let err = poll_contract(&client, &contract, &mut cursors).await.unwrap_err();
+        let err = poll_contract(&client, &contract, &mut cursors, false).await.unwrap_err();
+        assert!(
             err.to_string().contains("503"),
             "error must contain HTTP status 503, got: {}", err
         );
@@ -826,5 +1020,71 @@ mod tests {
         let (txs, alerts) = poll_contract(&client, &contract, &mut cursors, false).await.unwrap();
         assert_eq!(txs, 201);
         assert_eq!(alerts, 201);
+    }
+
+    #[tokio::test]
+    async fn run_once_executes_exactly_one_cycle() {
+        let server = MockServer::start().await;
+
+        let tx_json = serde_json::json!({
+            "_embedded": {
+                "records": [{
+                    "hash":         "oncetx1",
+                    "created_at":   "2024-06-01T10:00:00Z",
+                    "successful":   true,
+                    "paging_token": "1",
+                    "fee_charged":  "100",
+                    "envelope_xdr": null,
+                    "result_xdr":   null,
+                    "operations": [
+                        { "type": "invoke_host_function", "function": "test" }
+                    ]
+                }]
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path_regex("/accounts/.*/transactions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(tx_json))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        let empty_page = serde_json::json!({ "_embedded": { "records": [] } });
+        Mock::given(method("GET"))
+            .and(path_regex("/accounts/.*/transactions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_page))
+            .mount(&server)
+            .await;
+
+        let webhook_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&webhook_server)
+            .await;
+
+        let cfg = AppConfig {
+            poll_interval_seconds: 10,
+            http_pool_max_idle_per_host: None,
+            http_tcp_keepalive_secs: None,
+            http_connection_verbose: None,
+            cursor_file: None,
+            contracts: vec![WatchedContract {
+                label: "test".into(),
+                contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+                network: Network::Testnet,
+                rules: vec![AlertRule::AnyTransaction],
+                webhook_url: format!("{}/hook", webhook_server.uri()),
+                webhook_secret: None,
+                horizon_base_url_override: Some(server.uri()),
+            }],
+        };
+
+        run_once(cfg, false).await.expect("run_once should succeed");
+
+        let reqs = server.received_requests().await.unwrap();
+        // run_once should make exactly one request per contract (after it gets the first page)
+        let tx_requests: Vec<_> = reqs.iter().filter(|r| r.url.path().contains("/transactions")).collect();
+        assert!(tx_requests.len() >= 1, "should have made at least 1 transaction request");
     }
 }

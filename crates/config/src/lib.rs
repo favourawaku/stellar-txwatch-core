@@ -4,8 +4,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_path_to_error::Deserializer as PathDeserializer;
-use std::{fmt, fs, path::Path};
+use std::{env, fmt, fs, path::Path};
 use url::Url;
 
 const MAX_LARGE_TRANSFER_THRESHOLD_XLM: u64 = 1_000_000_000;
@@ -292,22 +291,11 @@ fn default_http_tcp_keepalive_secs() -> Option<u64> {
     None
 }
 
-fn deserialize_toml_with_field_context<'de, T>(raw: &'de str, path: &Path) -> Result<T>
+fn deserialize_toml_with_field_context<'de, T>(raw: &'de str, _path: &Path) -> Result<T>
 where
     T: DeserializeOwned,
 {
-    let mut deserializer = toml::Deserializer::new(raw);
-    let mut path_deserializer = PathDeserializer::new(&mut deserializer);
-    T::deserialize(&mut path_deserializer).map_err(|error| {
-        let path = error.path().to_string();
-        let inner = error.into_inner();
-        let message = if path.is_empty() {
-            inner.to_string()
-        } else {
-            format!("{} (field: {})", inner, path)
-        };
-        anyhow!(message)
-    })
+    toml::from_str(raw).context("failed to parse config file")
 }
 
 // ── Env-var interpolation ─────────────────────────────────────────────────────
@@ -627,8 +615,11 @@ mod tests {
                 http_pool_max_idle_per_host: None,
                 http_tcp_keepalive_secs: None,
                 http_connection_verbose: None,
+                contracts: Vec::new(),
+                cursor_file: None,
             };
             let err = cfg.validate().unwrap_err();
+            assert!(
                 err.to_string().contains("poll_interval_seconds must be >= 5"),
                 "val={} should be rejected: {}", val, err
             );
